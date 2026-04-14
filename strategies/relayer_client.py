@@ -243,8 +243,18 @@ class RelayerClient:
                     logger.info(f"Relayer OK: id={tx_id} state={state}")
                     return result
                 else:
-                    logger.error(f"Relayer {resp.status}: {text}")
-                    return None
+                    # Truncate error body so Cloudflare HTML pages don't
+                    # flood the log with thousands of lines.
+                    snippet = (text or "").strip()
+                    if len(snippet) > 200:
+                        snippet = snippet[:200] + "... [truncated]"
+                    # Single-line
+                    snippet = snippet.replace("\n", " ").replace("\r", " ")
+                    if resp.status == 429:
+                        logger.error("Relayer 429: rate limited by Cloudflare")
+                    else:
+                        logger.error(f"Relayer {resp.status}: {snippet}")
+                    return {"__http_status": resp.status}
         except Exception as e:
             logger.error(f"Relayer request error: {e}")
             return None
@@ -310,7 +320,7 @@ class RelayerClient:
             description=f"Split ${amount_usdc} USDC -> YES+NO",
             session=session,
         )
-        if result is None:
+        if result is None or "__http_status" in result:
             return False
         if wait:
             return await self._wait_confirmed(
@@ -335,7 +345,7 @@ class RelayerClient:
             description=f"Merge {amount_usdc} YES+NO -> USDC",
             session=session,
         )
-        if result is None:
+        if result is None or "__http_status" in result:
             return False
         if wait:
             return await self._wait_confirmed(
@@ -356,7 +366,7 @@ class RelayerClient:
             description="Redeem winning tokens",
             session=session,
         )
-        if result is None:
+        if result is None or "__http_status" in result:
             return False
         if wait:
             return await self._wait_confirmed(

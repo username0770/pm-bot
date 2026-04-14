@@ -114,6 +114,12 @@ button.reload:hover{border-color:var(--accent2)}
   </nav>
 </header>
 <main>
+  <section id="portfolio-section" style="margin-bottom:18px">
+    <div style="color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.5px; margin-bottom:6px">
+      Polymarket — live portfolio
+    </div>
+    <div class="kpis" id="portfolio-kpis"></div>
+  </section>
   <div class="kpis" id="kpis"></div>
   <div class="header-row">
     <span></span>
@@ -301,6 +307,45 @@ function renderTree(data){
   }
 }
 
+function renderPortfolio(p){
+  const box = document.getElementById("portfolio-kpis");
+  box.innerHTML = "";
+  if (!p || p.error){
+    box.innerHTML = `<div class="empty">Portfolio unavailable${p && p.error ? ": " + p.error : ""}</div>`;
+    return;
+  }
+  box.appendChild(kpi(
+    "Портфель",
+    fmt$(p.total_portfolio_usdc),
+    p.total_portfolio_usdc > 0 ? "green" : ""
+  ));
+  box.appendChild(kpi(
+    "Наличные USDC",
+    fmt$(p.cash_usdc)
+  ));
+  box.appendChild(kpi(
+    "Выигрыш (to redeem)",
+    fmt$(p.winnings_redeemable_usdc) +
+      ` <span class="tiny">${p.redeemable_positions_count || 0} поз.</span>`,
+    p.winnings_redeemable_usdc > 0 ? "yellow" : ""
+  ));
+  box.appendChild(kpi(
+    "Открытые позиции",
+    fmt$(p.open_positions_value_usdc) +
+      ` <span class="tiny">${(p.positions_count || 0) - (p.redeemable_positions_count || 0)} поз.</span>`
+  ));
+}
+
+async function loadPortfolio(){
+  try{
+    const r = await fetch(API + "/portfolio");
+    const data = await r.json();
+    renderPortfolio(data);
+  } catch(e){
+    renderPortfolio({error: String(e)});
+  }
+}
+
 async function load(){
   try{
     const r = await fetch(API + "/maker-buy-report?tz_offset_hours=3");
@@ -317,7 +362,10 @@ async function load(){
 }
 
 load();
+loadPortfolio();
 setInterval(load, 30000);
+// Portfolio involves on-chain RPC — refresh less often
+setInterval(loadPortfolio, 60000);
 </script>
 </body>
 </html>

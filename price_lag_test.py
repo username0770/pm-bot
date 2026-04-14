@@ -43,6 +43,9 @@ from strategies.maker_buy_strategy import (
 # "No module named 'web3'" in some runtime conditions — this guarantees
 # the module is cached once and the worker can reuse it without re-import.
 from strategies.relayer_client import create_safe_relayer_client as _create_safe_relayer_client
+from strategies.telegram_notifier import (
+    create_telegram_notifier, TelegramNotifier
+)
 
 console = Console()
 
@@ -93,6 +96,9 @@ mm_config = load_mm_config_from_env()
 mm = None  # initialized after clob_client
 maker_buy_cfg = load_maker_buy_config()
 maker_buy = MakerBuyStrategy(maker_buy_cfg)
+
+# Telegram notifier (None if disabled / no credentials)
+tg = create_telegram_notifier()
 
 # Market-making constants
 SETTLEMENT_DELAY = 128
@@ -1070,6 +1076,14 @@ async def polymarket_user_ws():
                                             sec_left = get_timer(
                                                 market_info.get("endDate")
                                             )
+                                            # The trade event id is the
+                                            # on-chain trade hash; carry it
+                                            # so reconcile loop can dedup.
+                                            tx_h = (
+                                                evt.get("transaction_hash")
+                                                or evt.get("transactionHash")
+                                                or full_trade_id or None
+                                            )
                                             labdb.save_maker_buy_trade({
                                                 "window_id": market_info.get("slug", ""),
                                                 "condition_id": market_info.get("conditionId", ""),
@@ -1079,7 +1093,11 @@ async def polymarket_user_ws():
                                                 "size": mo_size,
                                                 "usdc_spent": round(mo_price * mo_size, 4),
                                                 "seconds_to_expiry": sec_left,
-                                                "filled_at": datetime.utcnow().isoformat(),
+                                                # tz-naive UTC iso to keep DB format consistent
+                                                "filled_at": datetime.now(timezone.utc)
+                                                                .replace(tzinfo=None).isoformat(),
+                                                "tx_hash": tx_h,
+                                                "source": "ws",
                                             })
                                         except Exception as e:
                                             console.print(
@@ -1191,8 +1209,12 @@ async def polymarket_user_ws():
                                 # CRITICAL: drop cancelled/expired orders
                                 # from MakerBuy tracker so future ladders
                                 # aren't blocked by phantom entries.
-                                if full_oid and full_oid in maker_buy._active_order_ids:
-                                    maker_buy.on_order_expired(full_oid)
+                                # Also mark the recently-cancelled entry
+                                # as server-confirmed (shorter grace window).
+                                if full_oid:
+                                    if full_oid in maker_buy._active_order_ids:
+                                        maker_buy.on_order_expired(full_oid)
+                                    maker_buy.confirm_cancel(full_oid)
 
         except Exception as e:
             console.print(f"[yellow]User WS reconnect: {e}[/yellow]")
@@ -1826,6 +1848,135 @@ async def chainlink_loop():
             await asyncio.sleep(2)
 
 
+async def maker_buy_reconcile_loop():
+    """Periodically reconcile our DB against Polymarket Data API.
+    Catches fills lost to WS race conditions / reconnects.
+
+    - Runs every 10 minutes.
+    - Fetches recent trades for our Safe address from Data API.
+    - For each trade, checks if it's already in maker_buy_trades
+      (dedup by tx_hash, then fuzzy by condition+label+price+size+time).
+    - Inserts missing trades with source='reconcile'.
+    - Read-only against Polymarket; only INSERTs into our local DB.
+    """
+    import os
+    from datetime import datetime, timezone
+    safe_addr = os.getenv("MM2_SAFE", "").strip().lower()
+    if not safe_addr:
+        console.print("[yellow]Reconcile: MM2_SAFE not set — skip[/yellow]")
+        return
+
+    CYCLE_SEC = 600       # 10 minutes
+    STARTUP_DELAY = 45    # let WS settle first
+    PAGE_SIZE = 500
+    MAX_PAGES = 6         # 3000 trades = several days back
+    # Only reconcile trades older than this many seconds. Gives WS
+    # plenty of time to deliver naturally so we don't double-count.
+    MIN_AGE_SEC = 120
+
+    await asyncio.sleep(STARTUP_DELAY)
+    console.print("[bold cyan]MakerBuyReconcile loop started[/bold cyan]")
+
+    cycle = 0
+    async with aiohttp.ClientSession() as session:
+        while not is_done():
+            cycle += 1
+            started = time.time()
+            inserted = 0
+            checked = 0
+            try:
+                # Pull last MAX_PAGES * PAGE_SIZE trades, page by page
+                for page in range(MAX_PAGES):
+                    offset = page * PAGE_SIZE
+                    url = (
+                        "https://data-api.polymarket.com/trades"
+                        f"?user={safe_addr}&takerOnly=false"
+                        f"&limit={PAGE_SIZE}&offset={offset}"
+                    )
+                    try:
+                        async with session.get(
+                            url, timeout=aiohttp.ClientTimeout(total=20)
+                        ) as r:
+                            if r.status != 200:
+                                break
+                            data = await r.json()
+                    except Exception:
+                        break
+                    if not isinstance(data, list) or not data:
+                        break
+
+                    cutoff = time.time() - MIN_AGE_SEC
+                    for t in data:
+                        if not isinstance(t, dict):
+                            continue
+                        ts = int(t.get("timestamp") or 0)
+                        if ts == 0 or ts > cutoff:
+                            continue  # too fresh, may still arrive via WS
+                        side = (t.get("side") or "").upper()
+                        if side != "BUY":
+                            continue  # maker_buy is BUY-only
+                        outcome = (t.get("outcome") or "")
+                        # Polymarket: outcome="Up" -> YES, "Down" -> NO
+                        if outcome.lower() == "up":
+                            label = "YES"
+                        elif outcome.lower() == "down":
+                            label = "NO"
+                        else:
+                            continue
+                        cid = t.get("conditionId", "")
+                        slug = t.get("slug", "") or t.get("eventSlug", "")
+                        size = float(t.get("size") or 0)
+                        price = float(t.get("price") or 0)
+                        if not (cid and size > 0 and price > 0):
+                            continue
+                        # ISO timestamp from unix
+                        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+                        filled_iso = dt.replace(tzinfo=None).isoformat()
+                        tx_hash = t.get("transactionHash", "") or None
+                        # Synthetic order_id for reconcile inserts
+                        synth_oid = (
+                            f"reconcile_{tx_hash[:16]}_{cid[:8]}_{label}"
+                            if tx_hash else
+                            f"reconcile_{ts}_{cid[:8]}_{label}_{int(price*1000)}"
+                        )
+                        checked += 1
+                        try:
+                            ok = await asyncio.to_thread(
+                                labdb.save_reconcile_trade,
+                                {
+                                    "window_id": slug,
+                                    "condition_id": cid,
+                                    "order_id": synth_oid,
+                                    "token_label": label,
+                                    "price": price,
+                                    "size": size,
+                                    "filled_at": filled_iso,
+                                    "tx_hash": tx_hash,
+                                },
+                            )
+                            if ok:
+                                inserted += 1
+                        except Exception:
+                            pass
+                    if len(data) < PAGE_SIZE:
+                        break
+
+                if inserted > 0 or cycle <= 3:
+                    console.print(
+                        f"[dim cyan]MakerBuyReconcile #{cycle}: "
+                        f"checked={checked} inserted={inserted}[/dim cyan]"
+                    )
+            except Exception as e:
+                console.print(f"[red]reconcile cycle err: {e}[/red]")
+
+            elapsed = time.time() - started
+            wait = max(60, CYCLE_SEC - elapsed)
+            chunk = 10
+            while wait > 0 and not is_done():
+                await asyncio.sleep(min(chunk, wait))
+                wait -= chunk
+
+
 async def maker_buy_rebate_loop():
     """Periodically backfill maker_rebate_usdc per trade from
     Polymarket CLOB /rebates/current endpoint.
@@ -1896,16 +2047,37 @@ async def maker_buy_redeem_loop():
 
 
 async def _maker_buy_redeem_worker():
-    """Settle outcomes + redeem winners. Runs every 60 seconds with a
+    """Settle outcomes + redeem winners. Runs every 5 minutes with a
     hard timeout on each relayer call to prevent hangs.
+
+    Two redeem sources:
+      A) Local DB (maker_buy_trades with outcome set, redeemed=0) —
+         fast, covers fills we successfully tracked.
+      B) Polymarket on-chain positions (/positions?redeemable=true) —
+         ground truth, catches positions even if we missed the fill in
+         the WS pipeline.
     """
+    import os
     create_safe_relayer_client = _create_safe_relayer_client
     CYCLE_SEC = 300  # 5 minutes
     STARTUP_DELAY = 8
     REDEEM_TIMEOUT = 25
+    # Don't retry the same condition more often than this (avoid spam
+    # if a specific redeem keeps failing for server-side reasons).
+    RETRY_COOLDOWN_SEC = 1800  # 30 min
+    # Hard cap per cycle (combined across DB + on-chain paths).
+    # Polymarket Relayer is rate-limited by Cloudflare (~few req/sec).
+    MAX_PER_CYCLE = 15
+    # Sleep between consecutive relayer calls to avoid 429.
+    REDEEM_DELAY_SEC = 0.8
+    # Stop cycle early after N consecutive failures (likely rate-limited).
+    CIRCUIT_BREAKER_FAILS = 3
 
+    safe_addr = os.getenv("MM2_SAFE", "").strip().lower()
     relayer = None
     cycle = 0
+    # condition_id -> last_attempt_ts
+    recently_tried: dict = {}
     console.print(
         f"[bold cyan]MakerBuyRedeem worker started "
         f"(cycle={CYCLE_SEC}s, startup={STARTUP_DELAY}s)[/bold cyan]"
@@ -1917,16 +2089,35 @@ async def _maker_buy_redeem_worker():
             cycle += 1
             started = time.time()
 
-            # 1. Settle outcomes for pending maker_buy windows via Gamma
+            # 1. Settle outcomes for pending maker_buy windows via Gamma.
+            # Now returns {"settled": N, "losses_by_window": {slug: [rows]}}
             settled = 0
+            losses_by_window = {}
             try:
-                settled = await asyncio.wait_for(
+                settle_result = await asyncio.wait_for(
                     labdb.settle_pending_maker_buy(session), timeout=30,
                 )
+                if isinstance(settle_result, dict):
+                    settled = settle_result.get("settled", 0)
+                    losses_by_window = settle_result.get(
+                        "losses_by_window", {}
+                    )
+                else:
+                    settled = settle_result or 0
             except asyncio.TimeoutError:
                 console.print("[yellow]MakerBuy settle timeout[/yellow]")
             except Exception as e:
                 console.print(f"[red]MakerBuy settle err: {e}[/red]")
+
+            # 1b. Telegram notifications for losing windows
+            if tg is not None and losses_by_window:
+                for slug, losers in losses_by_window.items():
+                    try:
+                        asyncio.create_task(
+                            tg.notify_losses_batch(losers)
+                        )
+                    except Exception:
+                        pass
 
             # 2. Get windows ready to redeem
             windows = []
@@ -1942,6 +2133,64 @@ async def _maker_buy_redeem_worker():
                 f"[dim cyan]MakerBuyRedeem #{cycle}: "
                 f"settled={settled} pending={len(windows)}[/dim cyan]"
             )
+
+            # 3b. Hourly Telegram digest (internally throttled to 1/h)
+            if tg is not None:
+                try:
+                    asyncio.create_task(
+                        _build_and_send_hourly_report(session)
+                    )
+                except Exception:
+                    pass
+
+            # Combined counters + circuit breaker (shared between DB
+            # and on-chain paths within ONE cycle).
+            attempted_this_cycle = 0
+            consecutive_fails = 0
+            cycle_aborted = False
+
+            async def _try_redeem(cid, label_for_log, mark_slug=None):
+                """One redeem call with circuit-breaker + rate-limit.
+                Returns ('ok' | 'fail' | 'abort'). Updates outer counters
+                via nonlocal."""
+                nonlocal attempted_this_cycle, consecutive_fails, cycle_aborted
+                if cycle_aborted:
+                    return "abort"
+                if attempted_this_cycle >= MAX_PER_CYCLE:
+                    cycle_aborted = True
+                    return "abort"
+                attempted_this_cycle += 1
+                try:
+                    ok = await asyncio.wait_for(
+                        relayer.redeem(
+                            condition_id=cid,
+                            session=session,
+                            wait=False,
+                        ),
+                        timeout=REDEEM_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    ok = False
+                except Exception as e:
+                    console.print(
+                        f"[red]redeem err {label_for_log}: {e}[/red]"
+                    )
+                    ok = False
+                if ok:
+                    consecutive_fails = 0
+                    if mark_slug:
+                        try: labdb.mark_maker_buy_redeemed(mark_slug)
+                        except Exception: pass
+                    return "ok"
+                consecutive_fails += 1
+                if consecutive_fails >= CIRCUIT_BREAKER_FAILS:
+                    console.print(
+                        f"[yellow]redeem circuit-breaker tripped "
+                        f"(>={CIRCUIT_BREAKER_FAILS} consecutive fails), "
+                        f"pausing until next cycle[/yellow]"
+                    )
+                    cycle_aborted = True
+                return "fail"
 
             if windows:
                 if relayer is None:
@@ -1962,41 +2211,77 @@ async def _maker_buy_redeem_worker():
                     ok_count = 0
                     fail_count = 0
                     for window_id, condition_id in windows:
-                        try:
-                            ok = await asyncio.wait_for(
-                                relayer.redeem(
-                                    condition_id=condition_id,
-                                    session=session,
-                                    wait=False,
-                                ),
-                                timeout=REDEEM_TIMEOUT,
-                            )
-                            if ok:
-                                labdb.mark_maker_buy_redeemed(window_id)
-                                ok_count += 1
-                            else:
-                                fail_count += 1
-                                console.print(
-                                    f"[yellow]redeem fail: "
-                                    f"{window_id[:25]}[/yellow]"
-                                )
-                        except asyncio.TimeoutError:
+                        res = await _try_redeem(
+                            condition_id, window_id[:25], mark_slug=window_id)
+                        if res == "ok":
+                            ok_count += 1
+                        elif res == "fail":
                             fail_count += 1
-                            console.print(
-                                f"[yellow]redeem timeout: "
-                                f"{window_id[:25]}[/yellow]"
-                            )
-                        except Exception as e:
-                            fail_count += 1
-                            console.print(
-                                f"[red]redeem err "
-                                f"{window_id[:25]}: {e}[/red]"
-                            )
+                        else:  # abort
+                            break
+                        await asyncio.sleep(REDEEM_DELAY_SEC)
                     if ok_count or fail_count:
                         console.print(
-                            f"[cyan]MakerBuyRedeem result: "
-                            f"ok={ok_count} fail={fail_count}[/cyan]"
+                            f"[cyan]MakerBuyRedeem DB: "
+                            f"ok={ok_count} fail={fail_count}"
+                            f"{' [aborted]' if cycle_aborted else ''}[/cyan]"
                         )
+
+            # 4. ON-CHAIN FALLBACK: fetch /positions and redeem anything
+            #    marked redeemable=true that we haven't tried recently.
+            #    Shares the per-cycle cap and circuit breaker with DB path.
+            if safe_addr and not cycle_aborted:
+                try:
+                    on_chain_pending = await _fetch_onchain_redeemables(
+                        session, safe_addr
+                    )
+                except Exception as e:
+                    console.print(
+                        f"[yellow]on-chain positions err: {e}[/yellow]"
+                    )
+                    on_chain_pending = []
+
+                now = time.time()
+                for cid in list(recently_tried.keys()):
+                    if now - recently_tried[cid] > RETRY_COOLDOWN_SEC:
+                        recently_tried.pop(cid, None)
+                fresh = [
+                    (cid, slug, sz) for (cid, slug, sz) in on_chain_pending
+                    if cid not in recently_tried
+                ]
+
+                if fresh:
+                    if relayer is None:
+                        try:
+                            relayer = create_safe_relayer_client()
+                        except Exception as e:
+                            console.print(
+                                f"[red]relayer init err: {e}[/red]"
+                            )
+                    if relayer is not None:
+                        console.print(
+                            f"[cyan]MakerBuyRedeem on-chain: "
+                            f"{len(fresh)} redeemable[/cyan]"
+                        )
+                        ok_oc = 0
+                        fail_oc = 0
+                        for cid, slug, sz in fresh:
+                            recently_tried[cid] = now
+                            res = await _try_redeem(
+                                cid, cid[:16], mark_slug=slug)
+                            if res == "ok":
+                                ok_oc += 1
+                            elif res == "fail":
+                                fail_oc += 1
+                            else:
+                                break
+                            await asyncio.sleep(REDEEM_DELAY_SEC)
+                        if ok_oc or fail_oc:
+                            console.print(
+                                f"[cyan]OnChain redeem: "
+                                f"ok={ok_oc} fail={fail_oc}"
+                                f"{' [aborted]' if cycle_aborted else ''}[/cyan]"
+                            )
 
             # Sleep remainder in small chunks so is_done() is checked often
             elapsed = time.time() - started
@@ -2005,6 +2290,424 @@ async def _maker_buy_redeem_worker():
             while wait > 0 and not is_done():
                 await asyncio.sleep(min(chunk, wait))
                 wait -= chunk
+
+
+async def _build_and_send_hourly_report(session):
+    """Collect stats + portfolio, send to Telegram. Throttled internally."""
+    if tg is None:
+        return
+    # Early exit if it's too soon — saves the stats query
+    if time.time() - tg._last_hourly < 3600:
+        return
+
+    import os
+    safe_addr = os.getenv("MM2_SAFE", "").strip().lower()
+
+    # Today's stats from DB
+    try:
+        st = labdb.get_maker_buy_stats_today(tz_offset_hours=3.0)
+    except Exception:
+        st = {}
+
+    # Portfolio snapshot — reuse the /portfolio logic
+    portfolio = {"cash_usdc": 0, "winnings_redeemable_usdc": 0,
+                 "total_portfolio_usdc": 0}
+    if safe_addr:
+        try:
+            url = (
+                "https://data-api.polymarket.com/positions"
+                f"?user={safe_addr}&sizeThreshold=0.01&limit=500"
+            )
+            async with session.get(
+                url, timeout=aiohttp.ClientTimeout(total=8)
+            ) as r:
+                if r.status == 200:
+                    data = await r.json() or []
+                    red = sum(float(p.get("currentValue", 0) or 0)
+                              for p in data if isinstance(p, dict)
+                              and p.get("redeemable"))
+                    open_val = sum(float(p.get("currentValue", 0) or 0)
+                                   for p in data if isinstance(p, dict)
+                                   and not p.get("redeemable"))
+                    portfolio["winnings_redeemable_usdc"] = red
+                    portfolio["total_portfolio_usdc"] = red + open_val
+        except Exception:
+            pass
+    # Cash balance via RPC (reuse /portfolio env var)
+    try:
+        import os as _os
+        rpc = _os.getenv("POLYGON_RPC",
+                         "https://polygon.gateway.tenderly.co")
+        call_data = "0x70a08231" + "000000000000000000000000" + safe_addr[2:]
+        payload = {
+            "jsonrpc": "2.0", "method": "eth_call", "id": 1,
+            "params": [{
+                "to": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+                "data": call_data,
+            }, "latest"],
+        }
+        async with session.post(
+            rpc, json=payload, timeout=aiohttp.ClientTimeout(total=6)
+        ) as r:
+            j = await r.json()
+            res = j.get("result", "")
+            if res:
+                portfolio["cash_usdc"] = int(res, 16) / 1e6
+                portfolio["total_portfolio_usdc"] += portfolio["cash_usdc"]
+    except Exception:
+        pass
+
+    # Compute minutes-since-last-fill
+    last_min = 0.0
+    last_iso = st.get("last_filled_at")
+    if last_iso:
+        try:
+            from datetime import datetime, timezone
+            dt = datetime.fromisoformat(last_iso.replace("Z", ""))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            last_min = (datetime.now(timezone.utc) - dt).total_seconds() / 60
+        except Exception:
+            pass
+
+    stats = {
+        "winrate_pct": st.get("winrate_pct", 0),
+        "total_pnl_today": st.get("total_pnl", 0),
+        "trades_today": st.get("total_trades", 0),
+        "wins_today": st.get("wins", 0),
+        "cash_usdc": portfolio["cash_usdc"],
+        "winnings_usdc": portfolio["winnings_redeemable_usdc"],
+        "portfolio_value": portfolio["total_portfolio_usdc"],
+        "bot_alive": True,
+        "last_trade_minutes_ago": last_min,
+    }
+    await tg.send_hourly_report(stats)
+
+
+# ── Telegram command handlers + pause flags ─────────────────
+
+# Pause flags in kv_store override .env enable flags at runtime.
+# Cached for 5 sec so we don't hit DB every polling tick.
+_tg_pause_cache = {"mm": False, "mb": False, "ts": 0.0}
+
+def _is_paused(key: str) -> bool:
+    """True if 'mm' or 'mb' was /stop'd via Telegram. Cached 5 sec."""
+    now = time.time()
+    if now - _tg_pause_cache["ts"] > 5:
+        try:
+            _tg_pause_cache["mm"] = bool(labdb.get_kv("mm_paused"))
+            _tg_pause_cache["mb"] = bool(labdb.get_kv("maker_buy_paused"))
+            _tg_pause_cache["ts"] = now
+        except Exception:
+            pass
+    return bool(_tg_pause_cache.get(key, False))
+
+
+def _fmt_dollar(v):
+    try:
+        return f"${float(v):,.2f}"
+    except Exception:
+        return "$—"
+
+
+async def _cmd_help(_args: str) -> str:
+    return (
+        "<b>Команды PM Bot:</b>\n"
+        "/status — текущее состояние окна + активные ордера\n"
+        "/stats — статистика за сегодня\n"
+        "/balance — портфель on-chain\n"
+        "/last [N] — последние N ставок (default 5)\n"
+        "/stop — пауза MM и MakerBuy (новые ордера не ставятся)\n"
+        "/start — возобновить\n"
+        "/cancel — отменить все активные MakerBuy ордера\n"
+        "/help — эта справка"
+    )
+
+
+async def _cmd_status(_args: str) -> str:
+    try:
+        secs = get_timer(market_info.get("endDate")) or 0
+    except Exception:
+        secs = 0
+    slug = market_info.get("slug", "?")
+    cap = maker_buy_cfg.max_usdc_per_window or 0
+    spent = maker_buy._window_usdc_spent
+    line_mm = "🔴 PAUSED" if _is_paused("mm") else (
+        "✅ enabled" if mm_config.enabled else "⚫ disabled (cfg)"
+    )
+    line_mb = "🔴 PAUSED" if _is_paused("mb") else (
+        "✅ enabled" if maker_buy_cfg.enabled else "⚫ disabled (cfg)"
+    )
+    return (
+        f"<b>Status</b>\n"
+        f"Window: <code>{slug}</code>\n"
+        f"Осталось: {secs:.0f}с\n\n"
+        f"MM: {line_mm}\n"
+        f"MakerBuy: {line_mb}\n\n"
+        f"Active MB orders: {len(maker_buy._active_order_ids)}\n"
+        f"Side: {maker_buy._active_side or '—'}\n"
+        f"Top price: {maker_buy._active_max_price or '—'}\n"
+        f"Spent this window: {_fmt_dollar(spent)}"
+        f"{' / ' + _fmt_dollar(cap) if cap else ''}\n"
+        f"Window bets: {maker_buy._window_bets}/{maker_buy_cfg.max_bets_per_window}"
+    )
+
+
+async def _cmd_stats(_args: str) -> str:
+    try:
+        today = labdb.get_maker_buy_stats_today(tz_offset_hours=3.0)
+    except Exception as e:
+        return f"Ошибка: {e}"
+    try:
+        claimable = labdb.get_maker_buy_claimable_summary()
+    except Exception:
+        claimable = {"windows": 0, "payout_usdc": 0, "trades": 0}
+    return (
+        f"<b>Stats today</b>\n"
+        f"Trades: {today.get('total_trades', 0)}\n"
+        f"Wins: {today.get('wins', 0)}\n"
+        f"Winrate: {today.get('winrate_pct', 0)}%\n"
+        f"Invested: {_fmt_dollar(today.get('total_invested', 0))}\n"
+        f"P&L: {_fmt_dollar(today.get('total_pnl', 0))}\n\n"
+        f"Claimable now: {_fmt_dollar(claimable.get('payout_usdc', 0))} "
+        f"({claimable.get('windows', 0)} окон, {claimable.get('trades', 0)} тр)"
+    )
+
+
+async def _cmd_balance(_args: str) -> str:
+    """Мини-версия /portfolio для Telegram."""
+    safe_addr = os.getenv("MM2_SAFE", "").strip().lower()
+    if not safe_addr:
+        return "MM2_SAFE not set"
+    cash = None; winnings = 0.0; open_val = 0.0; total_pos = 0
+    try:
+        async with aiohttp.ClientSession() as sess:
+            # Cash via Polygon RPC
+            rpc = os.getenv("POLYGON_RPC",
+                            "https://polygon.gateway.tenderly.co")
+            call_data = "0x70a08231" + "000000000000000000000000" + safe_addr[2:]
+            try:
+                async with sess.post(rpc, json={
+                    "jsonrpc":"2.0","method":"eth_call","id":1,
+                    "params":[{
+                        "to":"0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+                        "data":call_data}, "latest"],
+                }, timeout=aiohttp.ClientTimeout(total=6)) as r:
+                    j = await r.json()
+                    if j.get("result"):
+                        cash = int(j["result"], 16) / 1e6
+            except Exception:
+                pass
+            # Positions
+            try:
+                async with sess.get(
+                    "https://data-api.polymarket.com/positions",
+                    params={"user": safe_addr,
+                            "sizeThreshold": 0.01, "limit": 500},
+                    timeout=aiohttp.ClientTimeout(total=8),
+                ) as r:
+                    if r.status == 200:
+                        data = await r.json() or []
+                        total_pos = len(data)
+                        for p in data:
+                            cv = float(p.get("currentValue", 0) or 0)
+                            if p.get("redeemable"):
+                                winnings += cv
+                            else:
+                                open_val += cv
+            except Exception:
+                pass
+    except Exception as e:
+        return f"Ошибка: {e}"
+    total = (cash or 0) + winnings + open_val
+    return (
+        f"<b>Balance</b>\n"
+        f"Cash USDC: {_fmt_dollar(cash) if cash is not None else '— (RPC down)'}\n"
+        f"Winnings (claimable): {_fmt_dollar(winnings)}\n"
+        f"Open positions: {_fmt_dollar(open_val)} ({total_pos - int(winnings>0):.0f} поз)\n"
+        f"────────\n"
+        f"Portfolio: <b>{_fmt_dollar(total)}</b>"
+    )
+
+
+async def _cmd_last(args: str) -> str:
+    n = 5
+    try:
+        n = int(args.strip()) if args.strip() else 5
+    except Exception:
+        n = 5
+    n = max(1, min(20, n))
+    try:
+        rows = labdb.get_maker_buy_trades(limit=n)
+    except Exception as e:
+        return f"Ошибка: {e}"
+    if not rows:
+        return "Пусто"
+    lines = [f"<b>Last {len(rows)}:</b>"]
+    for r in rows:
+        outcome = (r.get("outcome") or "—")
+        pnl = r.get("pnl")
+        pnl_s = f" pnl={_fmt_dollar(pnl)}" if pnl is not None else ""
+        lines.append(
+            f"{r.get('token_label') or '?'} "
+            f"{float(r.get('size') or 0):.1f}sh @ "
+            f"{float(r.get('price') or 0):.3f} → {outcome}{pnl_s}"
+        )
+    return "\n".join(lines)
+
+
+async def _cmd_stop(_args: str) -> str:
+    try:
+        labdb.save_kv("mm_paused", True)
+        labdb.save_kv("maker_buy_paused", True)
+    except Exception as e:
+        return f"Ошибка: {e}"
+    # Invalidate cache so new state applies immediately
+    _tg_pause_cache["ts"] = 0
+    return (
+        "🔴 Стратегии поставлены на паузу.\n"
+        "Новые ордера не ставятся.\n"
+        "Существующие резидентные ордера останутся активными до TTL "
+        "(либо используй /cancel чтобы отменить их сейчас)."
+    )
+
+
+async def _cmd_start(_args: str) -> str:
+    try:
+        labdb.save_kv("mm_paused", False)
+        labdb.save_kv("maker_buy_paused", False)
+    except Exception as e:
+        return f"Ошибка: {e}"
+    _tg_pause_cache["ts"] = 0
+    return "✅ Стратегии возобновлены."
+
+
+async def _cmd_cancel(_args: str) -> str:
+    """Отменяет все активные MakerBuy ордера прямо сейчас."""
+    if clob_client is None:
+        return "Клиент не готов"
+    stale = list(maker_buy._active_order_ids)
+    if not stale:
+        return "Нет активных ордеров"
+    try:
+        await asyncio.to_thread(clob_client.cancel_orders, stale)
+    except Exception as e:
+        return f"Cancel err: {e}"
+    maker_buy.clear_active_orders()
+    return f"🔁 Отменено {len(stale)} ордеров"
+
+
+def _register_tg_commands():
+    if tg is None:
+        return
+    for name, h in (
+        ("help", _cmd_help),
+        ("start", _cmd_start),
+        ("stop", _cmd_stop),
+        ("status", _cmd_status),
+        ("stats", _cmd_stats),
+        ("balance", _cmd_balance),
+        ("last", _cmd_last),
+        ("cancel", _cmd_cancel),
+    ):
+        tg.register_command(name, h)
+
+
+async def _sync_maker_buy_onchain_spent(session):
+    """Reconcile MakerBuy in-memory `_window_usdc_spent` with the real
+    on-chain position for the CURRENT window. Protects the per-window
+    spend cap from being fooled by lost WS fills.
+
+    Logic:
+      - Look up current condition_id from market_info.
+      - Fetch /positions for our Safe, find position with matching
+        conditionId on the side we're trading (YES/NO).
+      - Use `initialValue` (USDC committed) as on-chain truth.
+      - If it's larger than in-memory _window_usdc_spent, upgrade it.
+        Never downgrade (fills always add, never subtract).
+    """
+    import os
+    safe_addr = os.getenv("MM2_SAFE", "").strip().lower()
+    if not safe_addr:
+        return None
+    cid = market_info.get("conditionId", "") or ""
+    side = (maker_buy._active_side or "").upper()
+    if not cid or side not in ("YES", "NO"):
+        return None
+    try:
+        url = (
+            "https://data-api.polymarket.com/positions"
+            f"?user={safe_addr}&sizeThreshold=0.01&limit=100"
+        )
+        async with session.get(
+            url, timeout=aiohttp.ClientTimeout(total=6)
+        ) as r:
+            if r.status != 200:
+                return None
+            data = await r.json()
+    except Exception:
+        return None
+    if not isinstance(data, list):
+        return None
+    # Find matching conditionId AND side (Polymarket "outcome": "Up"/"Down")
+    want_outcome = "Up" if side == "YES" else "Down"
+    for p in data:
+        if not isinstance(p, dict):
+            continue
+        if p.get("conditionId") != cid:
+            continue
+        if (p.get("outcome") or "") != want_outcome:
+            continue
+        # initialValue = total USDC committed to this position
+        try:
+            on_chain_cost = float(p.get("initialValue") or 0)
+        except Exception:
+            continue
+        if on_chain_cost <= 0:
+            return 0.0
+        if on_chain_cost > maker_buy._window_usdc_spent:
+            diff = on_chain_cost - maker_buy._window_usdc_spent
+            console.print(
+                f"[yellow]MAKER_BUY cap sync: in-memory "
+                f"${maker_buy._window_usdc_spent:.2f} -> on-chain "
+                f"${on_chain_cost:.2f} (+${diff:.2f} recovered)[/yellow]"
+            )
+            maker_buy._window_usdc_spent = on_chain_cost
+        return on_chain_cost
+    return 0.0  # no matching position found
+
+
+async def _fetch_onchain_redeemables(session, safe_addr_lc: str):
+    """Return list of (condition_id, slug, size_shares) tuples for
+    positions where redeemable=True on Polymarket. Grouped by
+    condition_id (one entry per market even if YES+NO both redeemable).
+    """
+    url = (
+        "https://data-api.polymarket.com/positions"
+        f"?user={safe_addr_lc}&sizeThreshold=0.01&limit=500"
+    )
+    async with session.get(
+        url, timeout=aiohttp.ClientTimeout(total=15)
+    ) as r:
+        if r.status != 200:
+            return []
+        data = await r.json()
+    if not isinstance(data, list):
+        return []
+    # Dedup by condition_id, keep largest size
+    by_cid = {}
+    for p in data:
+        if not isinstance(p, dict) or not p.get("redeemable"):
+            continue
+        cid = p.get("conditionId") or ""
+        if not cid:
+            continue
+        sz = float(p.get("size", 0) or 0)
+        slug = p.get("slug") or p.get("eventSlug") or ""
+        existing = by_cid.get(cid)
+        if existing is None or sz > existing[2]:
+            by_cid[cid] = (cid, slug, sz)
+    return list(by_cid.values())
 
 
 async def polling_loop():
@@ -2223,7 +2926,7 @@ async def polling_loop():
                     AUTO_BETS_ENABLED = auto_ctrl.get("enabled", True)
 
             # Market Maker cycle (every ~2s)
-            if mm and mm.cfg.enabled and poll_counter % 4 == 0:
+            if mm and mm.cfg.enabled and not _is_paused("mm") and poll_counter % 4 == 0:
                 # Build book from WS live data (more accurate than CLOB /book)
                 mm_book = last_order_book if isinstance(last_order_book, dict) else {}
                 # If WS has live bid/ask, use those as primary
@@ -2251,9 +2954,25 @@ async def polling_loop():
                     aio_session=session,
                 )
 
+            # ── MAKER BUY: on-chain cap sync (every ~10 sec) ────
+            # Correct _window_usdc_spent against real on-chain position
+            # so the per-window USDC cap can't be fooled by lost WS fills.
+            # poll_counter ticks every 0.5s; % 20 -> every ~10 seconds.
+            if (maker_buy_cfg.enabled
+                    and maker_buy_cfg.max_usdc_per_window > 0
+                    and poll_counter % 20 == 0
+                    and maker_buy._active_side):
+                try:
+                    await _sync_maker_buy_onchain_spent(session)
+                except Exception as e:
+                    console.print(
+                        f"[dim yellow]MakerBuy cap sync err: {e}[/dim yellow]"
+                    )
+
             # ── MAKER BUY STRATEGY (independent of MM) ──────────
             # poll_counter ticks every 0.5s; % 2 -> runs every ~1 second.
-            if maker_buy_cfg.enabled and clob_client and poll_counter % 2 == 0:
+            if (maker_buy_cfg.enabled and clob_client
+                    and not _is_paused("mb") and poll_counter % 2 == 0):
                 mb_up_token = market_info.get("up_token", "")
                 mb_down_token = market_info.get("down_token", "")
                 if mb_up_token:
@@ -3126,6 +3845,20 @@ async def main():
         except Exception:
             pass
     mm = MarketMaker(cfg=mm_config, clob_client=clob_client, on_event=_mm_event_cb)
+    # Wire Telegram notification for split failures
+    if tg is not None:
+        def _on_split_failed(condition_id, error):
+            try:
+                asyncio.create_task(
+                    tg.notify_split_failed(condition_id, str(error))
+                )
+            except Exception:
+                pass
+        mm.on_split_failed = _on_split_failed
+
+    # Register Telegram command handlers (uses globals `mm`, `maker_buy` etc.)
+    _register_tg_commands()
+
     if mm_config.enabled:
         console.print(f"[cyan]+ MM enabled: {mm_config.strategy} "
                       f"| {mm_config.ladder_levels} levels "
@@ -3147,12 +3880,29 @@ async def main():
     if not current_window_slug:
         current_window_slug = current_5min_slug()
 
+    # Telegram startup notification (async, fire-and-forget)
+    if tg is not None:
+        mods = []
+        if mm_config.enabled: mods.append("✅ MM")
+        if maker_buy_cfg.enabled: mods.append("✅ MakerBuy")
+        if REAL_BETTING_ENABLED: mods.append("✅ Real betting")
+        asyncio.create_task(tg.send_startup(mods))
+
     async def safe(name, coro):
-        """Wrap coroutine to prevent one crash from killing all."""
+        """Wrap coroutine to prevent one crash from killing all.
+        Reports critical crashes to Telegram if enabled."""
         try:
             await coro
         except Exception as e:
             console.print(f"[bold red]{name} crashed: {e}[/bold red]")
+            if tg is not None:
+                try:
+                    asyncio.create_task(
+                        tg.notify_error(f"{name} crashed: {e}",
+                                        source=name, cooldown_sec=300)
+                    )
+                except Exception:
+                    pass
 
     await asyncio.gather(
         safe("Binance", binance_stream()),
@@ -3169,6 +3919,9 @@ async def main():
         safe("User WS", polymarket_user_ws()),
         safe("MakerBuyRedeem", maker_buy_redeem_loop()),
         safe("MakerBuyRebate", maker_buy_rebate_loop()),
+        safe("MakerBuyReconcile", maker_buy_reconcile_loop()),
+        safe("TelegramPoll",
+             tg.poll_updates_loop() if tg is not None else asyncio.sleep(0)),
     )
 
     console.print("\n[bold green]Done![/bold green]")

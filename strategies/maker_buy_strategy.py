@@ -72,11 +72,15 @@ class MakerBuyConfig:
 class MakerBuyStrategy:
     """BUY YES with maker limit orders when ask price >= entry_threshold."""
 
-    # Grace window for fills arriving after cancel. A real race condition:
-    # cancel is sent, order might already be partially matched at the server,
-    # the fill event arrives up to 1-2s later. We need to still save those
-    # fills to DB and update _window_usdc_spent.
-    CANCEL_GRACE_SEC = 90
+    # Grace window for fills arriving after cancel. Two states:
+    #   - "confirmed cancel" (server sent CANCELLATION via WS): keep for
+    #     CANCEL_GRACE_SEC after confirmation. Fills shouldn't really
+    #     arrive after server confirms cancel, but keep some slack.
+    #   - "unconfirmed cancel" (we sent cancel but no server WS confirm):
+    #     keep for CANCEL_UNCONFIRMED_GRACE_SEC. Server may still match
+    #     the order if it was in flight; we must still account those fills.
+    CANCEL_GRACE_SEC = 300            # 5 minutes after WS-confirmed cancel
+    CANCEL_UNCONFIRMED_GRACE_SEC = 1800  # 30 min if cancel wasn't confirmed
 
     def __init__(self, cfg: MakerBuyConfig):
         self.cfg = cfg
@@ -85,8 +89,9 @@ class MakerBuyStrategy:
         self._last_window_id: str = ""
         self._active_order_ids: set = set()
         self._active_order_expiry: dict = {}  # oid -> epoch seconds
-        # oid -> cancel_timestamp. Fills for these OIDs within
-        # CANCEL_GRACE_SEC are still accounted.
+        # oid -> (cancel_timestamp, confirmed_bool). Fills for these
+        # OIDs are still accounted while the entry exists. Pruning uses
+        # different lifetimes for confirmed vs unconfirmed cancels.
         self._recently_cancelled: dict = {}
         self._active_max_price: float = 0.0
         self._active_side: str = ""  # "YES" / "NO" / ""
@@ -103,19 +108,44 @@ class MakerBuyStrategy:
             self._active_side = ""
             logger.debug(f"MakerBuy: new window {window_id[:16]}")
 
-    def _mark_cancelled(self, order_id: str) -> None:
+    def _mark_cancelled(self, order_id: str, confirmed: bool = False) -> None:
         """Mark an OID as recently-cancelled so late fills are still
-        counted. Safe to call multiple times."""
-        self._recently_cancelled[order_id] = time.time()
+        counted. `confirmed=True` if WS CANCELLATION event arrived from
+        server. Safe to call multiple times — re-marking with confirmed=True
+        upgrades an existing unconfirmed entry."""
+        existing = self._recently_cancelled.get(order_id)
+        if existing is not None:
+            old_ts, old_conf = existing if isinstance(existing, tuple) else (existing, False)
+            # Upgrade unconfirmed -> confirmed but keep original timestamp
+            if confirmed and not old_conf:
+                self._recently_cancelled[order_id] = (old_ts, True)
+            return
+        self._recently_cancelled[order_id] = (time.time(), confirmed)
+
+    def confirm_cancel(self, order_id: str) -> None:
+        """Mark an OID as server-confirmed cancelled (called from WS
+        CANCELLATION handler). If OID isn't tracked yet, add it as
+        confirmed (unusual but harmless)."""
+        if not order_id:
+            return
+        existing = self._recently_cancelled.get(order_id)
+        if existing is None:
+            self._recently_cancelled[order_id] = (time.time(), True)
+        else:
+            ts, _ = existing if isinstance(existing, tuple) else (existing, False)
+            self._recently_cancelled[order_id] = (ts, True)
 
     def _prune_recently_cancelled(self) -> None:
         if not self._recently_cancelled:
             return
         now = time.time()
-        stale = [
-            oid for oid, ts in self._recently_cancelled.items()
-            if now - ts > self.CANCEL_GRACE_SEC
-        ]
+        stale = []
+        for oid, val in self._recently_cancelled.items():
+            ts, confirmed = val if isinstance(val, tuple) else (val, False)
+            limit = (self.CANCEL_GRACE_SEC if confirmed
+                     else self.CANCEL_UNCONFIRMED_GRACE_SEC)
+            if now - ts > limit:
+                stale.append(oid)
         for oid in stale:
             self._recently_cancelled.pop(oid, None)
 

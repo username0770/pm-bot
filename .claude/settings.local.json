@@ -265,7 +265,18 @@
       "Bash(.venv/Scripts/python.exe _tmp_race_test.py)",
       "Bash(rm _tmp_race_test.py)",
       "Bash(xxd .gitignore)",
-      "Bash(printf '*.db\\\\n*.db-wal\\\\n*.db-shm\\\\n*.log\\\\n*.csv\\\\n*.pyc\\\\n__pycache__/\\\\n.env\\\\n.venv/\\\\nbetburger_last_raw.json\\\\ntarget.txt\\\\nprice_lag_report.html\\\\n')"
+      "Bash(printf '*.db\\\\n*.db-wal\\\\n*.db-shm\\\\n*.log\\\\n*.csv\\\\n*.pyc\\\\n__pycache__/\\\\n.env\\\\n.venv/\\\\nbetburger_last_raw.json\\\\ntarget.txt\\\\nprice_lag_report.html\\\\n')",
+      "Bash(curl -s http://localhost:8765/maker-buy-stats)",
+      "Bash(curl -s http://localhost:8765/health)",
+      "Bash(curl -s \"http://localhost:8765/maker-buy-report?tz_offset_hours=3\")",
+      "Bash(.venv/Scripts/python.exe _tmp_reconcile.py)",
+      "Bash(.venv/Scripts/python.exe _tmp_full_test.py)",
+      "Bash(rm _tmp_full_test.py _tmp_reconcile.py _tmp_test.db)",
+      "Bash(ls _tmp*)",
+      "Bash(curl -s http://localhost:8765/portfolio)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:8765/portfolio)",
+      "Bash(grep -n \"datetime.utcnow\" price_lag_test.py strategies/*.py btc_lab_db.py btc_lab_api.py)",
+      "Bash(.venv/Scripts/python.exe -u -c ':*)"
     ]
   }
 }

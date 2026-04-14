@@ -3,6 +3,11 @@ Local API server — reads btc_lab.db, serves stats to agent-hq site.
 Run: python btc_lab_api.py
 """
 import os
+from dotenv import load_dotenv
+# Load .env at module import so every endpoint (including /portfolio
+# which reads MM2_SAFE) sees the env vars without per-request reload.
+load_dotenv()
+
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 import btc_lab_db as db
@@ -495,6 +500,88 @@ def maker_buy_report_page():
     from fastapi.responses import FileResponse
     p = Path(__file__).parent / "maker_buy_report.html"
     return FileResponse(str(p))
+
+
+@app.get("/portfolio")
+async def get_portfolio():
+    """Read live Polymarket portfolio for the Safe wallet.
+    Returns cash (USDC on-chain), redeemable winnings, open-position value,
+    and total portfolio. Matches what Polymarket UI shows.
+    """
+    import httpx, json
+    safe = os.getenv("MM2_SAFE", "").strip()
+    safe_lc = safe.lower()
+    if not safe:
+        return {"error": "MM2_SAFE not set"}
+
+    USDC_ADDR = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # USDC.e on Polygon
+    RPC = os.getenv("POLYGON_RPC",
+                    "https://polygon.gateway.tenderly.co")
+
+    cash_usdc = None
+    winnings = None
+    open_val = 0.0
+    redeemable_val = 0.0
+    positions_count = 0
+    redeemable_count = 0
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        # 1) USDC balance on Polygon via ERC20 balanceOf
+        try:
+            call_data = "0x70a08231" + "000000000000000000000000" + safe[2:]
+            payload = {
+                "jsonrpc": "2.0", "method": "eth_call", "id": 1,
+                "params": [{"to": USDC_ADDR, "data": call_data}, "latest"],
+            }
+            r = await client.post(RPC, json=payload)
+            result = r.json().get("result", "")
+            if result:
+                cash_usdc = int(result, 16) / 1e6
+        except Exception as e:
+            cash_usdc = None
+
+        # 2) Redeemable winnings via /value
+        try:
+            r = await client.get(
+                "https://data-api.polymarket.com/value",
+                params={"user": safe_lc},
+            )
+            data = r.json()
+            if isinstance(data, list) and data:
+                winnings = float(data[0].get("value", 0) or 0)
+        except Exception:
+            winnings = None
+
+        # 3) Positions breakdown
+        try:
+            r = await client.get(
+                "https://data-api.polymarket.com/positions",
+                params={"user": safe_lc, "sizeThreshold": 0.01, "limit": 500},
+            )
+            positions = r.json() or []
+            if isinstance(positions, list):
+                positions_count = len(positions)
+                for p in positions:
+                    cv = float(p.get("currentValue", 0) or 0)
+                    if p.get("redeemable"):
+                        redeemable_count += 1
+                        redeemable_val += cv
+                    else:
+                        open_val += cv
+        except Exception:
+            pass
+
+    total = round((cash_usdc or 0) + redeemable_val + open_val, 2)
+
+    return {
+        "safe_address": safe,
+        "cash_usdc": round(cash_usdc, 2) if cash_usdc is not None else None,
+        "winnings_redeemable_usdc": round(winnings, 2) if winnings is not None else None,
+        "open_positions_value_usdc": round(open_val, 2),
+        "total_portfolio_usdc": total,
+        "positions_count": positions_count,
+        "redeemable_positions_count": redeemable_count,
+    }
 
 
 @app.get("/rebates")

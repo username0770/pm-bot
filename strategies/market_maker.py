@@ -183,6 +183,9 @@ class MarketMaker:
         self.cfg = cfg
         self.clob = clob_client
         self.on_event = on_event
+        # Optional callbacks for outside observers (e.g. Telegram).
+        # Signature: on_split_failed(condition_id: str, error: str) -> None
+        self.on_split_failed = None
         self.active_orders: dict = {}  # oid -> {token, side, price, size}
 
         # Stats
@@ -286,8 +289,9 @@ class MarketMaker:
             self._current_condition_id = condition_id
             self._window_question = market_info.get("question", "")
             if not self._window_start_iso:
-                from datetime import datetime
-                self._window_start_iso = datetime.utcnow().isoformat()
+                from datetime import datetime, timezone
+                self._window_start_iso = (datetime.now(timezone.utc)
+                    .replace(tzinfo=None).isoformat())
             _log(f"MM: attempting split ${self.cfg.split_amount_usdc}...", "cyan")
             try:
                 ok = await self._relayer.split(
@@ -310,8 +314,19 @@ class MarketMaker:
                 else:
                     _log("Split submit failed — will retry next cycle", "yellow")
                     # Do NOT set _split_done=True — allow retry
+                    if callable(self.on_split_failed):
+                        try:
+                            self.on_split_failed(
+                                condition_id, "submit returned False")
+                        except Exception:
+                            pass
             except Exception as e:
                 _log(f"Split error: {e}", "red")
+                if callable(self.on_split_failed):
+                    try:
+                        self.on_split_failed(condition_id, str(e))
+                    except Exception:
+                        pass
             return
 
         # === 3. NO TOKENS ===
@@ -569,8 +584,9 @@ class MarketMaker:
         self._last_requote_time = 0.0
         self._tick_size = None
         self._tick_token = ""
-        from datetime import datetime
-        self._window_start_iso = datetime.utcnow().isoformat()
+        from datetime import datetime, timezone
+        self._window_start_iso = (datetime.now(timezone.utc)
+            .replace(tzinfo=None).isoformat())
 
         self.window_stats = MMStats(
             window_start=time.time(),
@@ -639,7 +655,7 @@ class MarketMaker:
             return
         ws = self._prev_window_stats
         try:
-            from datetime import datetime
+            from datetime import datetime, timezone
             spread_pnl = ws.spread_pnl
             net_pnl = (
                 spread_pnl
@@ -650,7 +666,8 @@ class MarketMaker:
                 "window_id": self._prev_condition_id,
                 "window_question": self._prev_window_question,
                 "started_at": self._prev_window_start,
-                "completed_at": datetime.utcnow().isoformat(),
+                "completed_at": datetime.now(timezone.utc)
+                    .replace(tzinfo=None).isoformat(),
                 "split_amount_usdc": round(self._prev_split_amount, 4),
                 "split_done": 1 if self._prev_split_done else 0,
                 "yes_buys_count": ws.yes_buys_count,

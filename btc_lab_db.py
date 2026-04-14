@@ -6,10 +6,22 @@ import sqlite3
 import json
 import uuid
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 DB_PATH = Path(os.getenv("BTC_LAB_DB_PATH", str(Path(__file__).parent / "btc_lab.db")))
+
+
+def _utc_now_iso() -> str:
+    """Timezone-naive UTC timestamp in ISO format.
+    Replaces deprecated datetime.utcnow().isoformat() (Python 3.12+).
+    Output format matches historical DB values (no tz suffix)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+
+
+def _utc_now_ts_ms() -> int:
+    """UTC timestamp in milliseconds since epoch."""
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
 
 
 def get_conn():
@@ -228,11 +240,23 @@ def init_db():
         "ALTER TABLE maker_buy_trades ADD COLUMN seconds_to_expiry REAL",
         "ALTER TABLE maker_buy_trades ADD COLUMN maker_rebate_usdc REAL DEFAULT 0",
         "ALTER TABLE maker_buy_trades ADD COLUMN fee_usdc REAL DEFAULT 0",
+        "ALTER TABLE maker_buy_trades ADD COLUMN tx_hash TEXT",
+        "ALTER TABLE maker_buy_trades ADD COLUMN source TEXT DEFAULT 'ws'",
     ):
         try:
             conn.execute(col_def)
         except sqlite3.OperationalError:
             pass  # column exists
+    # Indexes for reconcile dedup speed
+    for idx in (
+        "CREATE INDEX IF NOT EXISTS idx_mb_tx_hash ON maker_buy_trades(tx_hash)",
+        "CREATE INDEX IF NOT EXISTS idx_mb_filled_at ON maker_buy_trades(filled_at)",
+        "CREATE INDEX IF NOT EXISTS idx_mb_dedup ON maker_buy_trades(condition_id, token_label, price, filled_at)",
+    ):
+        try:
+            conn.execute(idx)
+        except sqlite3.OperationalError:
+            pass
     conn.commit()
     conn.close()
     print(f"DB ready: {DB_PATH}")
@@ -241,8 +265,8 @@ def init_db():
 # === Strategies ===
 
 def create_strategy(name, description="", color="#3b82f6", **kwargs):
-    sid = f"strat_{int(datetime.utcnow().timestamp()*1000)}_{uuid.uuid4().hex[:4]}"
-    now = datetime.utcnow().isoformat()
+    sid = f"strat_{_utc_now_ts_ms()}_{uuid.uuid4().hex[:4]}"
+    now = _utc_now_iso()
     conn = get_conn()
     conn.execute("""
         INSERT INTO strategies (id,name,description,color,
@@ -308,7 +332,7 @@ def list_active_autobet_strategies():
 def update_strategy(sid, **kwargs):
     if not kwargs:
         return get_strategy(sid)
-    kwargs["updated_at"] = datetime.utcnow().isoformat()
+    kwargs["updated_at"] = _utc_now_iso()
     # Convert bools to int for SQLite
     for k in ("is_active", "autobet", "mirror"):
         if k in kwargs:
@@ -369,7 +393,7 @@ def upsert_session(session_id, **kwargs):
     conn = get_conn()
     exists = conn.execute("SELECT id FROM sessions WHERE id=?",
                           (session_id,)).fetchone()
-    now = datetime.utcnow().isoformat()
+    now = _utc_now_iso()
     if exists:
         if kwargs:
             cols = ", ".join(f"{k}=?" for k in kwargs)
@@ -449,8 +473,8 @@ VALID_COLS = {
 
 
 def save_bet(bet_data):
-    now = datetime.utcnow().isoformat()
-    bid = bet_data.get("id") or f"bet_{int(datetime.utcnow().timestamp()*1000)}_{uuid.uuid4().hex[:6]}"
+    now = _utc_now_iso()
+    bid = bet_data.get("id") or f"bet_{_utc_now_ts_ms()}_{uuid.uuid4().hex[:6]}"
 
     # Normalize keys
     norm = {}
@@ -479,7 +503,7 @@ def save_bet(bet_data):
 
 
 def settle_bet(bet_id, outcome, resolved_price, gross_pnl, net_pnl, roi):
-    now = datetime.utcnow().isoformat()
+    now = _utc_now_iso()
     conn = get_conn()
     conn.execute("""UPDATE bets SET outcome=?,resolved_price=?,
         gross_pnl=?,net_pnl=?,roi=?,resolved_at=? WHERE id=?""",
@@ -531,7 +555,7 @@ def delete_bet(bet_id):
 # === Ticks ===
 
 def save_tick(session_id, tick):
-    now = datetime.utcnow().isoformat()
+    now = _utc_now_iso()
     conn = get_conn()
     conn.execute("""INSERT INTO ticks
         (session_id,ts,binance,coinbase,okx,bybit,cex_median,chainlink,
@@ -671,7 +695,7 @@ async def auto_settle_pending(aio_session):
 # === KV Store (config, status) ===
 
 def save_kv(key, value):
-    now = datetime.utcnow().isoformat()
+    now = _utc_now_iso()
     conn = get_conn()
     conn.execute(
         "INSERT OR REPLACE INTO kv_store (key, value, updated_at) VALUES (?,?,?)",
@@ -693,7 +717,7 @@ def get_kv(key):
 
 
 def save_mm_event(event):
-    now = datetime.utcnow().isoformat()
+    now = _utc_now_iso()
     conn = get_conn()
     conn.execute("""INSERT INTO mm_events
         (session_id, event_type, side, price, size, level,
@@ -907,18 +931,115 @@ def save_maker_buy_trade(trade: dict) -> None:
         "usdc_spent": trade.get("usdc_spent", 0),
         "seconds_to_expiry": trade.get("seconds_to_expiry"),
         "filled_at": trade.get("filled_at", ""),
+        "tx_hash": trade.get("tx_hash"),
+        "source": trade.get("source", "ws"),
     }
     conn.execute(
         """INSERT OR IGNORE INTO maker_buy_trades
            (window_id, condition_id, order_id, token_label,
-            price, size, usdc_spent, seconds_to_expiry, filled_at)
+            price, size, usdc_spent, seconds_to_expiry, filled_at,
+            tx_hash, source)
            VALUES (:window_id, :condition_id, :order_id, :token_label,
                    :price, :size, :usdc_spent, :seconds_to_expiry,
-                   :filled_at)""",
+                   :filled_at, :tx_hash, :source)""",
         safe,
     )
     conn.commit()
     conn.close()
+
+
+def save_reconcile_trade(t: dict) -> bool:
+    """Insert a trade fetched from Polymarket Data API IF it's not
+    already present (fuzzy dedup against WS-saved rows).
+    Returns True if inserted.
+
+    Dedup strategy:
+      1. If tx_hash is set in DB and matches `t["tx_hash"]` → skip.
+      2. Fuzzy match: same condition_id + token_label + price (rounded
+         to 4 decimals) + size within 0.5 + filled_at within 60s.
+    """
+    cid = t.get("condition_id", "") or ""
+    label = t.get("token_label", "") or ""
+    price = float(t.get("price") or 0)
+    size = float(t.get("size") or 0)
+    filled_at = t.get("filled_at", "") or ""
+    tx_hash = t.get("tx_hash") or ""
+    if not (cid and label and filled_at and price > 0 and size > 0):
+        return False
+
+    conn = get_conn()
+    try:
+        # Strict tx_hash dedup
+        if tx_hash:
+            row = conn.execute(
+                "SELECT 1 FROM maker_buy_trades WHERE tx_hash=? LIMIT 1",
+                (tx_hash,),
+            ).fetchone()
+            if row:
+                conn.close()
+                return False
+
+        # Fuzzy dedup: same condition + label + price within 60s window
+        # Get candidates by indexed (condition_id, token_label, price)
+        price_q = round(price, 4)
+        cands = conn.execute(
+            """SELECT id, size, filled_at FROM maker_buy_trades
+               WHERE condition_id=? AND token_label=?
+                 AND ABS(price - ?) < 0.0005""",
+            (cid, label, price_q),
+        ).fetchall()
+        from datetime import datetime, timezone
+        try:
+            t_target = datetime.fromisoformat(filled_at.replace("Z", ""))
+            if t_target.tzinfo is None:
+                t_target = t_target.replace(tzinfo=timezone.utc)
+        except Exception:
+            t_target = None
+        for c in cands:
+            try:
+                c_size = float(c["size"] or 0)
+                if abs(c_size - size) > 0.5:
+                    continue
+                if t_target is not None and c["filled_at"]:
+                    c_dt = datetime.fromisoformat(c["filled_at"].replace("Z", ""))
+                    if c_dt.tzinfo is None:
+                        c_dt = c_dt.replace(tzinfo=timezone.utc)
+                    if abs((c_dt - t_target).total_seconds()) > 60:
+                        continue
+                # Match found
+                conn.close()
+                return False
+            except Exception:
+                continue
+
+        # No dedup hit — insert
+        conn.execute(
+            """INSERT INTO maker_buy_trades
+               (window_id, condition_id, order_id, token_label,
+                price, size, usdc_spent, seconds_to_expiry, filled_at,
+                tx_hash, source)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                t.get("window_id", ""),
+                cid,
+                t.get("order_id", ""),  # synthetic id from reconcile
+                label,
+                price,
+                size,
+                round(price * size, 4),
+                None,  # seconds_to_expiry unknown post-fact
+                filled_at,
+                tx_hash or None,
+                "reconcile",
+            ),
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception:
+        try: conn.close()
+        except Exception: pass
+        return False
 
 
 def get_maker_buy_windows_to_redeem() -> list:
@@ -989,16 +1110,17 @@ def get_maker_buy_windows_pending_outcome() -> list:
     return [r["window_id"] for r in rows]
 
 
-async def settle_pending_maker_buy(aio_session) -> int:
+async def settle_pending_maker_buy(aio_session) -> dict:
     """Independent settlement for maker_buy trades.
     Queries Gamma API for each pending window and updates outcome.
-    Does NOT depend on `bets` table. Returns count of windows settled.
+    Does NOT depend on `bets` table.
+    Returns {"settled": int, "losses_by_window": {slug: [trade dicts]}}.
     """
     import aiohttp
     windows = get_maker_buy_windows_pending_outcome()
+    result = {"settled": 0, "losses_by_window": {}}
     if not windows:
-        return 0
-    settled = 0
+        return result
     for slug in windows:
         try:
             url = f"https://gamma-api.polymarket.com/events?slug={slug}"
@@ -1014,10 +1136,68 @@ async def settle_pending_maker_buy(aio_session) -> int:
                 op = json.loads(m.get("outcomePrices", "[0,0]"))
                 resolved_outcome = "UP" if float(op[0]) > 0.5 else "DOWN"
                 update_maker_buy_outcome(slug, resolved_outcome)
-                settled += 1
+                result["settled"] += 1
+                # Collect losers just marked for this window so the caller
+                # (e.g. TelegramNotifier) can notify about them.
+                try:
+                    conn = get_conn()
+                    rows = conn.execute("""
+                        SELECT window_id, token_label, price, size,
+                               usdc_spent, seconds_to_expiry, outcome
+                        FROM maker_buy_trades
+                        WHERE window_id = ? AND COALESCE(won, 0) = 0
+                          AND outcome IS NOT NULL
+                    """, (slug,)).fetchall()
+                    conn.close()
+                    losers = [dict(r) for r in rows]
+                    if losers:
+                        result["losses_by_window"][slug] = losers
+                except Exception:
+                    pass
         except Exception:
             pass
-    return settled
+    return result
+
+
+def get_maker_buy_stats_today(tz_offset_hours: float = 3.0) -> dict:
+    """Stats for trades filled today (Europe/Kiev day by default).
+    Returns total_trades / wins / winrate_pct / total_pnl / total_invested /
+    last_filled_at."""
+    from datetime import datetime, timezone, timedelta
+    tz = timezone(timedelta(hours=tz_offset_hours))
+    today_local = datetime.now(tz).strftime("%Y-%m-%d")
+    # Convert local-day boundary to UTC range we can query via string compare
+    day_start_local = datetime.strptime(
+        today_local, "%Y-%m-%d").replace(tzinfo=tz)
+    day_end_local = day_start_local + timedelta(days=1)
+    utc_start = day_start_local.astimezone(timezone.utc) \
+        .replace(tzinfo=None).isoformat()
+    utc_end = day_end_local.astimezone(timezone.utc) \
+        .replace(tzinfo=None).isoformat()
+
+    conn = get_conn()
+    row = conn.execute("""
+        SELECT
+            COUNT(*) as total_trades,
+            COALESCE(SUM(CASE WHEN outcome IS NOT NULL THEN 1 ELSE 0 END), 0)
+                as settled_trades,
+            COALESCE(SUM(COALESCE(won, 0)), 0) as wins,
+            ROUND(COALESCE(SUM(usdc_spent), 0), 2) as total_invested,
+            ROUND(COALESCE(SUM(pnl), 0), 4) as total_pnl,
+            MAX(filled_at) as last_filled_at
+        FROM maker_buy_trades
+        WHERE filled_at >= ? AND filled_at < ?
+    """, (utc_start, utc_end)).fetchone()
+    conn.close()
+    if not row:
+        return {"total_trades": 0, "wins": 0, "winrate_pct": 0.0,
+                "total_invested": 0.0, "total_pnl": 0.0,
+                "last_filled_at": None}
+    d = dict(row)
+    settled = d.get("settled_trades") or 0
+    d["winrate_pct"] = (round((d.get("wins") or 0) / settled * 100, 1)
+                        if settled > 0 else 0.0)
+    return d
 
 
 def get_maker_buy_stats() -> dict:
