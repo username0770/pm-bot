@@ -253,6 +253,7 @@ class PolymarketClient:
                     bet_id       = order_id,
                     filled_odds  = round(1.0 / price_rounded, 4) if price_rounded > 0 else 0,
                     filled_amount= float(filled) if filled else size,
+                    price        = price_rounded,   # фактическая цена ордера
                 )
             else:
                 msg = error_msg or f"status={status}"
@@ -271,8 +272,9 @@ class PolymarketClient:
         tick_size: str = "0.01",
     ) -> BetResult:
         """
-        Продаёт позицию по рыночной цене (best bid - 1 tick).
+        Продаёт позицию по рыночной цене (best bid).
         Используется как fallback когда SELL ордер не исполнен.
+        Возвращает BetResult.price = best_bid — фактическая цена сделки.
         """
         try:
             client = self._get_client()
@@ -286,15 +288,21 @@ class PolymarketClient:
 
             # Best bid — первый (самый высокий)
             best_bid = float(bids[0].price if hasattr(bids[0], "price") else bids[0].get("price", 0))
-            sell_price = best_bid  # Продаём по best bid для моментального исполнения
 
-            if sell_price <= 0:
+            if best_bid <= 0:
+                # Нет ликвидности — позиция фактически стоит 0, продажа невозможна
+                log.warning("PM market_sell: best_bid=0 для %s...%s — нет ликвидности",
+                            token_id[:12], token_id[-8:])
                 return BetResult(success=False, error="best bid is 0")
 
             log.info("PM market_sell: best_bid=%.4f, selling %s...%s × %.2f",
-                     sell_price, token_id[:12], token_id[-8:], size)
+                     best_bid, token_id[:12], token_id[-8:], size)
 
-            return await self.place_sell_order(token_id, sell_price, size, neg_risk, tick_size)
+            result = await self.place_sell_order(token_id, best_bid, size, neg_risk, tick_size)
+            # Гарантируем что price = best_bid даже если place_sell_order не вернул его
+            if result.success and not result.price:
+                result.price = best_bid
+            return result
 
         except Exception as e:
             log.error("PM place_market_sell исключение: %s", e, exc_info=True)

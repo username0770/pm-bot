@@ -821,13 +821,15 @@ class LiveValueBetBot:
                             try:
                                 r = await self.pm.place_market_sell(token_id, size, neg_risk, tick_size)
                                 if r.success:
-                                    mid = self.pm.get_midpoint(token_id) or entry_price
-                                    proceeds = round(size * mid, 2)
+                                    # Берём фактическую цену из BetResult.price (best_bid)
+                                    actual_price = r.price or entry_price
+                                    proceeds = round(size * actual_price, 2)
                                     profit = round(proceeds - round(size * entry_price, 2), 2)
-                                    self.db.update_resell_result(rec_id, "sold", profit, mid)
+                                    self.db.update_resell_result(rec_id, "sold", profit, actual_price)
                                     self.db.adjust_free_usdc(proceeds)
                                     self._unlock_outcome_after_resell(rec_id)
-                                    log.info("[LIVE resell] 💰 Market SELL #%d: P&L %+.2f$", rec_id, profit)
+                                    log.info("[LIVE resell] 💰 Market SELL #%d @ %.4f: P&L %+.2f$",
+                                             rec_id, actual_price, profit)
                                 else:
                                     self.db.update_resell_placed(rec_id, resell_status="expired")
                             except Exception:

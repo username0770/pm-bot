@@ -976,8 +976,8 @@ class ValueBetBot:
                                 mkt_result = await self.pm.place_market_sell(
                                     token_id, size, neg_risk, tick_size)
                                 if mkt_result.success:
-                                    mid = self.pm.get_midpoint(token_id)
-                                    actual_price = mid if mid else entry_price
+                                    # Берём фактическую цену из BetResult.price (best_bid)
+                                    actual_price = mkt_result.price or entry_price
                                     proceeds = round(size * actual_price, 2)
                                     cost = round(size * entry_price, 2)
                                     profit = round(proceeds - cost, 2)
@@ -986,7 +986,8 @@ class ValueBetBot:
                                                                 sell_price=actual_price)
                                     self.db.adjust_free_usdc(proceeds)
                                     self._unlock_outcome_after_resell(rec_id)
-                                    log.info("[resell] 💰 Market SELL #%d: P&L %+.2f$", rec_id, profit)
+                                    log.info("[resell] 💰 Market SELL #%d @ %.4f: P&L %+.2f$",
+                                             rec_id, actual_price, profit)
                                 else:
                                     self.db.update_resell_placed(rec_id, resell_status="expired")
                                     log.warning("[resell] ❌ Market SELL failed #%d: %s",

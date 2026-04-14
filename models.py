@@ -109,3 +109,4 @@ class BetResult:
     error: Optional[str] = None
     filled_odds: Optional[float] = None
     filled_amount: Optional[float] = None
+    price: Optional[float] = None   # фактическая цена исполнения (для SELL — цена продажи)

@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MakerBuy — отчёт</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@700;800&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#0b0d12; --panel:#11141b; --panel2:#161a23; --border:#252a36;
+  --text:#e6e8ef; --muted:#8a93a6; --accent:#4ade80; --accent2:#38bdf8;
+  --red:#f87171; --yellow:#facc15; --orange:#fb923c;
+}
+*{box-sizing:border-box}
+body{
+  margin:0;background:var(--bg);color:var(--text);
+  font-family:'Space Mono',ui-monospace,monospace;font-size:13px;
+}
+header{
+  padding:18px 24px;border-bottom:1px solid var(--border);
+  background:linear-gradient(180deg,#141826,#0b0d12);
+}
+h1{font-family:'Syne',sans-serif;font-size:22px;margin:0 0 4px}
+.sub{color:var(--muted);font-size:12px}
+nav{margin-top:10px;display:flex;gap:14px;font-size:12px}
+nav a{color:var(--accent2);text-decoration:none}
+nav a:hover{text-decoration:underline}
+main{padding:20px 24px;max-width:1500px;margin:0 auto}
+
+.kpis{
+  display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));
+  gap:12px;margin-bottom:20px;
+}
+.kpi{
+  background:var(--panel);border:1px solid var(--border);
+  border-radius:8px;padding:12px 14px;
+}
+.kpi .lbl{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+.kpi .val{font-size:19px;font-weight:700;margin-top:4px;font-family:'Syne',sans-serif}
+.kpi.green .val{color:var(--accent)}
+.kpi.red .val{color:var(--red)}
+.kpi.yellow .val{color:var(--yellow)}
+
+details{
+  background:var(--panel);border:1px solid var(--border);
+  border-radius:8px;margin-bottom:10px;overflow:hidden;
+}
+details[open]{border-color:#2f3648}
+summary{
+  list-style:none;cursor:pointer;padding:12px 16px;
+  display:grid;grid-template-columns:18px minmax(140px,1fr) repeat(8,minmax(90px,1fr));
+  gap:10px;align-items:center;
+  background:var(--panel2);
+}
+summary::-webkit-details-marker{display:none}
+summary .tri{color:var(--muted);transition:transform .15s}
+details[open] > summary .tri{transform:rotate(90deg)}
+
+.lvl-month > summary{background:#1a1f2c;font-size:14px}
+.lvl-day > summary{background:#161a23}
+.lvl-win > summary{background:#141821;font-size:12px}
+
+.col-label{font-weight:700;color:var(--text)}
+.lvl-month .col-label{color:#fff;font-size:15px;font-family:'Syne',sans-serif}
+.lvl-day .col-label{color:var(--accent2)}
+.lvl-win .col-label{color:var(--muted);font-family:'Space Mono',monospace}
+
+.num{text-align:right;font-variant-numeric:tabular-nums}
+.muted{color:var(--muted)}
+.pos{color:var(--accent)}
+.neg{color:var(--red)}
+.tiny{font-size:10px;color:var(--muted)}
+
+.pad{padding:8px 16px 14px;border-top:1px solid var(--border)}
+.sidecol{
+  display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));
+  gap:8px;margin-top:8px;font-size:11px;color:var(--muted);
+}
+.sidecol b{color:var(--text);font-weight:700}
+.badge{
+  display:inline-block;padding:2px 6px;border-radius:4px;
+  background:#222838;color:var(--muted);font-size:10px;margin-left:6px;
+}
+.badge.up{background:rgba(74,222,128,.18);color:var(--accent)}
+.badge.down{background:rgba(248,113,113,.18);color:var(--red)}
+.badge.pending{background:rgba(250,204,21,.18);color:var(--yellow)}
+.badge.redeemed{background:rgba(56,189,248,.18);color:var(--accent2)}
+
+.header-row{
+  display:grid;grid-template-columns:18px minmax(140px,1fr) repeat(8,minmax(90px,1fr));
+  gap:10px;padding:8px 16px;font-size:10px;text-transform:uppercase;
+  letter-spacing:.5px;color:var(--muted);border-bottom:1px solid var(--border);
+  background:var(--panel);border-radius:8px 8px 0 0;margin-bottom:8px;
+}
+.empty{
+  padding:24px;text-align:center;color:var(--muted);
+  background:var(--panel);border:1px dashed var(--border);border-radius:8px;
+}
+button.reload{
+  background:var(--panel2);color:var(--text);border:1px solid var(--border);
+  padding:6px 14px;border-radius:6px;cursor:pointer;font-family:inherit;
+}
+button.reload:hover{border-color:var(--accent2)}
+</style>
+</head>
+<body>
+<header>
+  <h1>MakerBuy — отчёт</h1>
+  <div class="sub">Иерархия: Месяц → День → Окно · TZ Europe/Kiev (UTC+3)</div>
+  <nav>
+    <a href="/dashboard.html">← Дашборд</a>
+    <a href="#" onclick="load();return false">↻ Обновить</a>
+    <span class="muted" id="loaded-at"></span>
+  </nav>
+</header>
+<main>
+  <div class="kpis" id="kpis"></div>
+  <div class="header-row">
+    <span></span>
+    <span>Период / Окно</span>
+    <span class="num">Trades</span>
+    <span class="num">Оборот $</span>
+    <span class="num">Shares</span>
+    <span class="num">Avg price</span>
+    <span class="num">Avg odds</span>
+    <span class="num">Rebate</span>
+    <span class="num">P&L net</span>
+    <span class="num">ROI %</span>
+  </div>
+  <div id="tree"></div>
+</main>
+
+<script>
+const API = (location.port === "8765")
+  ? "" : "http://localhost:8765";
+
+function fmt$(v){
+  if (v === null || v === undefined) return "—";
+  const n = Number(v);
+  const sign = n < 0 ? "-" : "";
+  return sign + "$" + Math.abs(n).toFixed(2);
+}
+function fmtNum(v, d=2){
+  if (v === null || v === undefined) return "—";
+  return Number(v).toFixed(d);
+}
+function cls(v){ return v > 0 ? "pos" : v < 0 ? "neg" : ""; }
+
+function kpi(lbl, val, variant=""){
+  const div = document.createElement("div");
+  div.className = "kpi " + variant;
+  div.innerHTML = `<div class="lbl">${lbl}</div><div class="val">${val}</div>`;
+  return div;
+}
+
+function renderKpis(data){
+  const box = document.getElementById("kpis");
+  box.innerHTML = "";
+
+  let tt = {trades:0, invested:0, rebate:0, pnl_net:0, size:0, wins:0, losses:0, windows:0};
+  for (const m of data.months || []){
+    tt.trades += m.trades || 0;
+    tt.invested += m.invested_usdc || 0;
+    tt.rebate += m.rebate_usdc || 0;
+    tt.pnl_net += m.pnl_net_usdc || 0;
+    tt.size += m.size || 0;
+    tt.wins += m.wins || 0;
+    tt.losses += m.losses || 0;
+    // window_count: new API field; fall back to numeric `windows` for old API
+    const mwc = (typeof m.window_count === 'number') ? m.window_count
+              : (typeof m.windows === 'number' ? m.windows : 0);
+    tt.windows += mwc;
+  }
+  const settled = tt.wins + tt.losses;
+  const winrate = settled > 0 ? (tt.wins / settled * 100).toFixed(1) + "%" : "—";
+  const roi = tt.invested > 0 ? (tt.pnl_net / tt.invested * 100).toFixed(2) + "%" : "—";
+
+  box.appendChild(kpi("Всего сделок", tt.trades));
+  box.appendChild(kpi("Окон", tt.windows));
+  box.appendChild(kpi("Оборот $", fmt$(tt.invested)));
+  box.appendChild(kpi("Оборот shares", fmtNum(tt.size, 0)));
+  box.appendChild(kpi("Rebate $", fmt$(tt.rebate), "yellow"));
+  box.appendChild(kpi("P&L net $", fmt$(tt.pnl_net), tt.pnl_net >= 0 ? "green" : "red"));
+  box.appendChild(kpi("ROI %", roi, tt.pnl_net >= 0 ? "green" : "red"));
+  box.appendChild(kpi("Winrate", winrate));
+
+  if (data.claimable){
+    const c = data.claimable;
+    box.appendChild(kpi(
+      "Claimable now",
+      fmt$(c.payout_usdc) + ` <span class="tiny">${c.windows} окон / ${c.trades} tr</span>`,
+      c.payout_usdc > 0 ? "yellow" : ""
+    ));
+  }
+}
+
+function rowCells(agg){
+  const pnl = agg.pnl_net_usdc;
+  return `
+    <span class="num">${agg.trades}</span>
+    <span class="num">${fmt$(agg.invested_usdc)}</span>
+    <span class="num">${fmtNum(agg.size, 1)}</span>
+    <span class="num">${fmtNum(agg.avg_price, 3)}</span>
+    <span class="num">${fmtNum(agg.avg_decimal_odds, 2)}</span>
+    <span class="num">${fmt$(agg.rebate_usdc)}</span>
+    <span class="num ${cls(pnl)}">${fmt$(pnl)}</span>
+    <span class="num ${cls(pnl)}">${fmtNum(agg.roi_pct, 1)}%</span>`;
+}
+
+function extraLine(agg, level){
+  const parts = [];
+  if (agg.wins !== undefined){
+    const sett = agg.wins + agg.losses;
+    const wr = sett > 0 ? (agg.wins/sett*100).toFixed(1) + "%" : "—";
+    parts.push(`<span><b>Winrate:</b> ${wr} (${agg.wins}/${sett})${agg.pending ? ` <span class="muted">+${agg.pending} pending</span>` : ""}</span>`);
+  }
+  if (agg.yes_trades !== undefined)
+    parts.push(`<span><b>YES:</b> ${agg.yes_trades} tr / ${fmt$(agg.yes_invested_usdc)}</span>`);
+  if (agg.no_trades !== undefined)
+    parts.push(`<span><b>NO:</b> ${agg.no_trades} tr / ${fmt$(agg.no_invested_usdc)}</span>`);
+  if (agg.avg_seconds_to_expiry !== null && agg.avg_seconds_to_expiry !== undefined)
+    parts.push(`<span><b>Avg sec to expiry:</b> ${fmtNum(agg.avg_seconds_to_expiry, 0)}s</span>`);
+  if (agg.pnl_gross_usdc !== undefined)
+    parts.push(`<span><b>P&L gross:</b> ${fmt$(agg.pnl_gross_usdc)}</span>`);
+  // window_count: new API field; fall back to numeric `windows` for old API.
+  // For day level, agg.windows is an ARRAY (nested windows list), so only
+  // treat it as a count when it's actually a number.
+  const wc = (typeof agg.window_count === 'number') ? agg.window_count
+           : (typeof agg.windows === 'number' ? agg.windows : undefined);
+  if (level !== "win" && wc !== undefined){
+    parts.push(`<span><b>Окон:</b> ${wc}</span>`);
+    parts.push(`<span><b>Avg $/окно:</b> ${fmt$(agg.avg_invested_per_window)}</span>`);
+    parts.push(`<span><b>Avg shares/окно:</b> ${fmtNum(agg.avg_size_per_window, 1)}</span>`);
+    parts.push(`<span><b>Avg trades/окно:</b> ${fmtNum(agg.avg_trades_per_window, 1)}</span>`);
+  }
+  return `<div class="sidecol">${parts.join("")}</div>`;
+}
+
+function winBadges(w){
+  const out = [];
+  if (w.outcome === "UP") out.push(`<span class="badge up">UP</span>`);
+  else if (w.outcome === "DOWN") out.push(`<span class="badge down">DOWN</span>`);
+  else out.push(`<span class="badge pending">pending</span>`);
+  if (w.redeemed) out.push(`<span class="badge redeemed">redeemed</span>`);
+  return out.join("");
+}
+
+function renderTree(data){
+  const root = document.getElementById("tree");
+  root.innerHTML = "";
+  const months = data.months || [];
+  if (!months.length){
+    root.innerHTML = `<div class="empty">Нет данных MakerBuy пока</div>`;
+    return;
+  }
+  // current month = first (sorted desc)
+  const currentMonth = months[0].month;
+
+  for (const m of months){
+    const md = document.createElement("details");
+    md.className = "lvl-month";
+    if (m.month === currentMonth) md.open = true;
+    md.innerHTML = `
+      <summary>
+        <span class="tri">▶</span>
+        <span class="col-label">${m.month}</span>
+        ${rowCells(m)}
+      </summary>
+      <div class="pad">
+        ${extraLine(m, "month")}
+      </div>`;
+    const pad = md.querySelector(".pad");
+
+    for (const d of m.days){
+      const dd = document.createElement("details");
+      dd.className = "lvl-day";
+      dd.innerHTML = `
+        <summary>
+          <span class="tri">▶</span>
+          <span class="col-label">${d.date}</span>
+          ${rowCells(d)}
+        </summary>
+        <div class="pad">${extraLine(d, "day")}</div>`;
+      const dpad = dd.querySelector(".pad");
+
+      for (const w of d.windows){
+        const wd = document.createElement("details");
+        wd.className = "lvl-win";
+        wd.innerHTML = `
+          <summary>
+            <span class="tri">▶</span>
+            <span class="col-label">${w.window_id}${winBadges(w)}</span>
+            ${rowCells(w)}
+          </summary>
+          <div class="pad">${extraLine(w, "win")}</div>`;
+        dpad.appendChild(wd);
+      }
+      pad.appendChild(dd);
+    }
+    root.appendChild(md);
+  }
+}
+
+async function load(){
+  try{
+    const r = await fetch(API + "/maker-buy-report?tz_offset_hours=3");
+    const data = await r.json();
+    renderKpis(data);
+    renderTree(data);
+    const now = new Date();
+    document.getElementById("loaded-at").textContent =
+      "· обновлено " + now.toLocaleTimeString();
+  } catch(e){
+    document.getElementById("tree").innerHTML =
+      `<div class="empty">Ошибка загрузки: ${e}</div>`;
+  }
+}
+
+load();
+setInterval(load, 30000);
+</script>
+</body>
+</html>
